@@ -9,7 +9,7 @@
 using namespace std;
 
 
-void print_set(vector<vector<int> > &s, const string title) {
+void print_set(vector<vector<int> > &s, const string &title) {
 	cout << title << endl;
 	for(vector<int> &x : s) {
 		for (int y : x) { 
@@ -34,6 +34,24 @@ void print_largeitemset(map<vector<int>, float> &large_itemsets) {
 	}
 	cout << "------------------------" << endl;
 
+}
+
+void print_rules(map<pair<vector<int>,vector<int> >, float> &rules) {
+	cout << "Rules with min confidence: " << endl;
+	for (auto &kv : rules) {
+		cout << "(";
+		for (int i : kv.first.first) {
+			cout << i << ",";
+		}
+		cout << ") => (";
+		for (int i : kv.first.second) {
+			cout << i << ",";
+		}
+		cout << "): ";
+		cout << kv.second;
+		cout << endl;
+	}
+	cout << "-------------------------" << endl;
 }
 void load_transactions(ifstream &input, vector<vector<int> > &transactions, int &m) {
 	string s;
@@ -155,6 +173,49 @@ void join_set( vector<vector<int> > &itemset, int k, vector<vector<int> > &candi
 	}
 
 }
+
+void get_subsets(vector<int> &arr, vector<vector<int> > &subsets) {
+	vector<int> empty;
+	subsets.push_back(empty);
+	for (int a : arr) {
+		vector<vector<int> > r = subsets;
+		for (vector<int> &x : r) {
+			x.push_back(a);
+		}
+		subsets.insert(subsets.end(), r.begin(), r.end());
+	}
+	subsets.erase(subsets.begin());
+}
+
+void get_rules(map<vector<int>, float> &large_itemsets, map<pair<vector<int>,vector<int> >, float> &rules, float min_conf) {
+	pair<vector<int>, vector<int> > temp;
+	vector<vector<int> > candidates;
+	float confidence;
+	for (const auto &kv: large_itemsets) {
+		candidates.push_back(kv.first);
+	}
+	for (unsigned int i = 0; i < candidates.size(); i++) {
+		if(candidates[i].size() == 1)
+			continue;
+		vector<vector<int> > subsets;
+		get_subsets(candidates[i], subsets);
+		for (vector<int> &x : subsets) {
+			vector<int> remain;
+			set_difference(candidates[i].begin(), candidates[i].end(), x.begin(), x.end(), inserter(remain,remain.begin()));
+			if(remain.size()) {
+				confidence = large_itemsets[candidates[i]]/large_itemsets[x];
+				if (confidence > min_conf) {
+					temp = make_pair(x, remain);
+					rules[temp] = confidence;
+				}
+			}
+		}
+
+		
+	}
+	
+
+}
 int main(int argc, char *argv[]) {
 	if (argc != 4) {
 		cout << "usage: ./apriori file support confidence" << endl;
@@ -164,6 +225,7 @@ int main(int argc, char *argv[]) {
 	float min_sup, min_conf;
 	vector<vector<int> > transactions, first_itemset, candidates, current_itemset;
 	map<vector<int>, float> large_itemsets;
+	map<pair<vector<int>,vector<int> >, float> rules;
 	ifstream input;
 	
 	min_sup = atof(argv[2]);
@@ -175,24 +237,19 @@ int main(int argc, char *argv[]) {
 	
 	get_1itemset(max_id, min_sup, transactions, first_itemset, large_itemsets);
 	current_itemset = first_itemset;
-	//print_set(first_itemset, "fisrst itemset");
 	for (int k = 2; ; k++) {
 		candidates.clear();
 		join_set(current_itemset, k, candidates);
-		//print_set(candidates,"candidates");
 		if (candidates.empty())
 			break;
 		current_itemset.clear();
 		itemsets_min_support(transactions, candidates, min_sup, current_itemset, large_itemsets);
-		//print_set(current_itemset,"candidates with min support");
 		
 	}
-	candidates.clear();
+	
+	
+	
+	get_rules(large_itemsets, rules, min_conf);
 	print_largeitemset(large_itemsets);
-	for (const auto &kv: large_itemsets) {
-		candidates.push_back(kv.first);
-	}
-	for (unsigned int i = 0; i < candidates.size(); i++) {
-		
-	}
+	print_rules(rules);
 }
