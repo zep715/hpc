@@ -8,19 +8,6 @@
 #include <algorithm>
 using namespace std;
 
-
-void print_set(vector<vector<int> > &s, const string &title) {
-	cout << title << endl;
-	for(vector<int> &x : s) {
-		for (int y : x) { 
-			cout << y << " ";
-		}
-		cout << ";";
-	}
-	cout << endl;
-
-}
-
 void print_largeitemset(map<vector<int>, float> &large_itemsets) {
 	cout << "Large itemsets with min support:" << endl;
 	for (auto &kv : large_itemsets) {
