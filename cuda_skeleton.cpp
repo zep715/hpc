@@ -2,7 +2,9 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 #include <cstdlib>
+#include <cstring>
 using namespace std;
 
 
@@ -47,6 +49,15 @@ void get_1itemset(int **transactions, int N, int M, float min_sup) {
 
     delete[] counter;
 }
+
+void join_set() {
+
+}
+
+void itemsets_with_min_support() {
+
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 4) {
         cout << "/apriori input_metadata min_support, min_confidence" << endl;
@@ -60,11 +71,13 @@ int main(int argc, char *argv[]) {
     parse_metadata(argv[1], csv, N, M);
     M++;
     int **transactions = new int*[N];
-    for (int i = 0; i < N; i++)
-        transactions[i] = new int[M]();
+    for (int i = 0; i < N; i++) {
+        transactions[i] = new int[M];
+        //new int[M]() fa bloccare il pc
+        memset(transactions[i], 0, M);
+    }
     parse_transactions(csv, transactions);
-    for (int i = 0; 
-    //get_1itemset(transactions, N, M, min_sup);
+    get_1itemset(transactions, N, M, min_sup);
     
     for (int i = 0; i < N; i++)
         delete[] transactions[i];
