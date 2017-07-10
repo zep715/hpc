@@ -12,8 +12,26 @@
 using namespace std;
 
 typedef unsigned char byte;
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
 
+__global__ void count1itemset(byte *, int, int, int *);
+struct Matrix {
+	int N;
+	int M;
+	byte *matrix;
+};
+
+typedef struct Matrix Matrix;
+
+void init_matrix(Matrix *m, int _N, int _M) {
+	m->N = _N;
+	m->M = _M;
+	m->matrix = new byte[_N*_M]();
+}
+
+void delete_matrix(Matrix *m) {
+	delete[] m->matrix;
+	m->matrix = NULL;
+}
 void parse_metadata(char *file, string &csv, int &N, int &M) {
 	ifstream metadata(file, ios::in);
 	metadata >> csv >> N >> M;
@@ -26,122 +44,103 @@ void parse_line(string &line, byte *transaction, int row, int cols) {
 	unsigned int value;
 	while (ss >> value) {
 		//transaction[value] = 1;
-		transaction[row*cols + value] = 1;
+		transaction[value] = 1;
 		if (ss.peek() == ',')
 			ss.ignore();
 	}
 
 }
 
-void parse_transactions(string &file, byte *transactions, int N, int M) {
+void parse_transactions(string &file, Matrix *m, int N, int M) {
 	ifstream csv(file, ios::in);
 	string line;
 	int i = 0;
 	while (getline(csv, line)) {
-		parse_line(line, transactions, i, M);
+		parse_line(line, &(m->matrix[i*M]), i, M);
 		i++;
 	}
 	csv.close();
 }
-__global__ void addKernel(int *c, const int *a, const int *b)
-{
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
+
+void copy_transactions_to_device(Matrix *m, byte **dev_matrix) {
+	cudaError_t status;
+	byte *temp;
+	status = cudaMalloc((void **)&temp, m->M * m->N * sizeof(byte));
+	if (status != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed! dev_matrix");
+		return;
+	}
+	status = cudaMemcpy(temp, m->matrix, m->M * m->N * sizeof(byte), cudaMemcpyHostToDevice);
+	if (status != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed! dev_matrix");
+		return;
+	}
+	*dev_matrix = temp;
+	
+	
 }
 
-__global__ void count1itemset(byte *transactions, int *N, int *M, int *counter) {
-	int element = threadIdx.x;
-	for (int i = 0; i < *N; i++) {
-		for (int j = 0; j < *M; j++) {
-			if (transactions[i*(*M)+j] == element)
-				counter[element]++;
+
+
+__global__ void count1itemset(byte *transactions, int N, int M, int *counter) {
+	
+	for (int i = 0; i < N; i++) {
+		for (int j = 0; j < M; j++) {
+			if (transactions[i*M + j]) {
+				counter[j]++;
+			}
+		}
+	}
+}	
+
+
+
+void get_1itemset(byte *dev_transactions,  int N, int M, float min_sup) {
+	int *counter = new int[M];
+	int *dev_counter;
+	cudaMalloc((void **)&dev_counter, M*sizeof(int));
+	cudaMemset(dev_counter, 0, M*sizeof(int));
+	count1itemset <<<1,1>>> (dev_transactions, N, M, dev_counter);
+	cudaDeviceSynchronize();
+	cudaMemcpy(counter, dev_counter, M*sizeof(int), cudaMemcpyDeviceToHost);
+	for (int i = 0; i < 2; i++)
+		cout << counter[i] << " ";
+	cout << endl;
+}
+
+__global__ void prova_gpu(byte *transactions, int N, int M, byte *res) {
+	for (int i = 0; i < N; i++) {
+		for (int j = 0; j < M; j++) {
+			res[i*M + j] = transactions[i*M + j];
 		}
 	}
 }
-
-cudaError_t get_1itemset(byte *transactions, int N, int M, float min_sup) {
-	int *counter, *dev_N, *dev_M;
-	int *ret = new int[M];
-	byte *t;
-	cudaError_t cudaStatus;
-
-	cudaStatus = cudaSetDevice(0);
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-		goto error;
+void prova(Matrix *m, byte *dev_transactions, int N, int M) {
+	byte *dev_counter;
+	cudaError_t status;
+	status = cudaMalloc((void **)&dev_counter, N*M*sizeof(byte));
+	if (status != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed! dev_matrix");
+		return;
 	}
-	cudaStatus = cudaMalloc((void**)&counter, M*sizeof(int));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed! counter");
-		goto error;
+	prova_gpu<<<1,1>>> (dev_transactions, N, M, dev_counter);
+	byte *prova = new byte[N*M];
+	status = cudaMemcpy(prova, dev_counter, N*M*sizeof(byte), cudaMemcpyDeviceToHost);
+	if (status != cudaSuccess) {
+		fprintf(stderr, "cudaMalloc failed! dev_matrix");
+		return;
 	}
-	cudaStatus = cudaMalloc((void**)&t, N*M*sizeof(byte));
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMalloc failed! transactions");
-		goto error;
+	cout << "----------" << endl;
+	for (int i = 0; i < 20; i++) {
+		for (int j = 0; j <40; j++)
+			cout << (int)prova[i*M + j] << " ";
+		cout << endl;
 	}
-	
-	cudaStatus = cudaMemcpy(t, transactions, N * M * sizeof(byte), cudaMemcpyHostToDevice);
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaMemcpy failed! transactions");
-		goto error;
-	}
-	cudaMalloc((void **)&dev_N, sizeof(int));
-	cudaMalloc((void **)&dev_M, sizeof(int));
-	cudaMemcpy(dev_N, &N, sizeof(int), cudaMemcpyHostToDevice);
-	cudaMemcpy(dev_M, &M, sizeof(int), cudaMemcpyHostToDevice);
-	cout << "before calling" << endl;
-	count1itemset<<<1, M >>>(t, dev_N, dev_M, counter); //count?
-	cout << "after calling" << endl;
-	cudaStatus = cudaGetLastError();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-		goto error;
-	}
-	cudaStatus = cudaDeviceSynchronize();
-	if (cudaStatus != cudaSuccess) {
-		fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-		goto error;
-	}
-	cudaStatus = cudaMemcpy(ret, counter, M * sizeof(int), cudaMemcpyDeviceToHost);
-	float temp;
-	for (int i = 0; i < M; i++) {
-		temp = ((float)counter[i]) / N;
-		if (temp > min_sup)
-			cout << i << endl;
-	}
-	error:
-	delete[] ret;
-	cudaFree(counter);
-	cudaFree(t);
-	return cudaStatus;
+	delete[] prova;
+	cudaFree(dev_counter);
 }
 int main()
 {
-	/*
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
-
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
-    }
-
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
-
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
-    }
-	*/
 	int N, M;
 	string csv;
 	float min_sup = 0.1;
@@ -149,99 +148,23 @@ int main()
 
 	parse_metadata("input.txt", csv, N, M);
 	M++;
-	byte *transactions = new byte[N*M]();
-	//int **transactions = new int*[N];
+	Matrix matrix;
+	init_matrix(&matrix, N, M);
+	parse_transactions(csv, &matrix,N,M);
+	for (int i = 0; i < 20; i++) {
+		for (int j = 0; j <40; j++)
+			cout << (int)matrix.matrix[i*M + j] << " "; 
+			cout << endl;
+	}
+	byte *dev_transactions;
+	cudaSetDevice(0);
 	
-	parse_transactions(csv, transactions,N,M);
-	get_1itemset(transactions, N, M, min_sup);
+	copy_transactions_to_device(&matrix, &dev_transactions);
+	//get_1itemset(dev_transactions, N, M, min_sup);
+	prova(&matrix, dev_transactions,  N,  M);
 
-	delete[] transactions;
+	cudaFree(dev_transactions);
+	delete_matrix(&matrix);
 	return 0;
 }
 
-
-
-//suddivisione matrice?
-
-
-// Helper function for using CUDA to add vectors in parallel.
-/*
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
-{
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
-
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
-
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
-
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
-
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
-}
-*/
