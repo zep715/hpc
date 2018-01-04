@@ -4,7 +4,7 @@
 #include <curand.h>
 #include <curand_kernel.h>
 
-int *x, *y, n, m, km, blocks = 40;
+int *x, *y, n, m, km;
 float *graph, *trails, *gpu_graph = NULL, *gpu_trails = NULL,*g_buffer = NULL;
 cudaEvent_t start, stop;
 float hparams[3] = {1.0, 5.0, 0.5};
@@ -44,6 +44,14 @@ float *init_trails(int n, float v) {
     return x;
 }
 
+float vmin(void *v, int n) {
+    float m = v[0];
+    for (int i = 1; i < n; i++)
+        if (v[i] < m)
+            m = v[i];
+    return m;
+}
+
 void *gpucopy(void *b, size_t l) {
     void *x;
     if(cudaMalloc(&x, l) != cudaSuccess)
@@ -78,23 +86,27 @@ void abort(const char *s) {
     exit(1);
 }
 
-__global__ void aco(float *ggraph, float *gtrails, float *gbuffer, curandState *states, int n, int nstadi, int niters) {
+__global__ void aco(float *ggraph, float *gtrails, float *scores, curandState *states, int n, int nstadi, int niters) {
     float *lgraph, *ltrails, *probs, *temp,score;
-    int *path,tid,nants,current;
+    int *path,tid,nants,current,*reduce;
     extern __shared__ int smem[];
-	__shared__ int fscore; //punteggio del formicaio
-    curandState state;
+    curandState *state;
 
     tid = threadIdx.x;
     nants = blockDim.x;
-    state = states[blockIdx.x*blockDim.x+threadIdx.x];
+    state = &states[blockIdx.x*blockDim.x+threadIdx.x];
+    /*
+        ripartizione shared memory
+    */
     lgraph = (float *) smem;
     ltrails = (float *) (smem + n*n);
-	temp = (float *) (smem +2*n*n);
+    temp = (float *) (smem +2*n*n);
     probs = (float *) (smem + 2*n*n + tid*n);
     path = (smem + 2*n*n + nants*n + tid*n);
-	reduce = (sem + 2*n*n + 2*nants*n);
-	
+    reduce = (smem + 2*n*n + 2*nants*n);
+    /*
+        copia in shared del grafo e delle tracce
+    */
     for (int i = 0; i < n; i++) {
         for (int j = tid; j < n; j+=nants) {
             lgraph[i*n+j] = ggraph[i*n+j];
@@ -107,84 +119,84 @@ __global__ void aco(float *ggraph, float *gtrails, float *gbuffer, curandState *
         }
     }
     __syncthreads();
-	for (int st = 0; st < nstadi; st++) {
-		for (int it = 0; i < niters; it++) {
-			score = 0.0;
-		    path[0] = curand(&state)%n;
-		    current = path[0];
-		    for (int i = 1; i < n; i++) {
-		        for (int j = 0; j < n; j++)
-		            probs[j] = __powf(ltrails[current*n+j],params[0])*__powf(1.0/lgraph[current*n+j],params[1]);
-		        for (int j = 0; j < i; j++)
-		            probs[path[j]] = 0.0f;
-		        float acc = 0;
-		        for (int j = 0; j < n; j++)
-		            acc += probs[j];
-		        for (int j = 0; j < n; j++)
-		            probs[j] /= acc;
-		        for (int j = 1; j < n; j++)
-		            probs[j] += probs[j-1];
-		        float choice = curand_uniform(&state);
-		        int k = 0;
-		        for (; choice > probs[k]; k++);
-		        current = k;
-		        path[i] = k;
-		        score += lgraph[current*n+path[i-1]];
-		    }
-		    score += lgraph[path[0]*n+path[n-1]];
-		    for (int i = 0; i < n; i++) {
-		        for (int j = tid; j< n; j+=nants) {
-		            ltrails[i*n+j] *= params[2];
-		        }
-		    }
-		    __syncthreads();
-		    for (int i = 1; i < n; i++) {
-		        atomicAdd(&ltrails[path[i]*n+path[i-1]], 1.0/score);
-		        atomicAdd(&ltrails[path[i-1]*n+path[i]],1.0/score);
-		    }
-		    atomicAdd(&ltrails[path[0]*n+path[n-1]],1.0/score);
-		    atomicAdd(&ltrails[path[n-1]*n+path[0]],1.0/score);
-		    __syncthreads();
-		}
-		/*
-			reduce intrablocco
-		*/
-		temp[tid] = score;
-		for (unsigned int s = nants/2; s > 0; s >>= 1) {
-			if (tid < s)
-				reduce[tid] = (temp[tid] < temp[tid+s])?tid:tid+s;
-			__synchthreads();
-		}
-		if (tid == reduce[0]) {
-			fscore = score;
-			gbuffer[blockIdx.x] = score;
-		}
-		__threadfence();
-		/*
-			reduce interblocco
-		*/
-		if (tid < gridDim.x)
-			temp[tid] = gbuffer[tid];
-		for (unsigned int s = gridDim.x/2; s > 0; s >>= 1) {
-			if (tid < s)
-				reduce[tid] = (temp[tid]  < temp[tid+s])?tid:tid+s;
-			__synchthreads();
-		}
-		if (blockIdx.x == reduce[0]) {
-			for (int i = 0; i < n; i++) {
-				for (int j = tid; j < n; j += nants) {
-					gtrails[i*n+j] = ltrails[i*n+j];
-				}
-			}
-		}
-		__threadfence();
-		for (int i = 0; i <n; i++) {
-			for (int j = tid; j < n; j += nants) {
-				ltrails[i*n+j] = gtrails[i*n+j];
-			}
-		}
-		__synchthreads();
-	}
+    
+    for (int st = 0; st < nstadi; st++) {
+        for (int it = 0; it < niters; it++) {
+            score = 0.0;
+            path[0] = curand(state)%n;
+            current = path[0];
+            for (int i = 1; i < n; i++) {
+                for (int j = 0; j < n; j++)
+                    probs[j] = __powf(ltrails[current*n+j],params[0])*__powf(1.0/lgraph[current*n+j],params[1]);
+                for (int j = 0; j < i; j++)
+                    probs[path[j]] = 0.0f;
+                float acc = 0;
+                for (int j = 0; j < n; j++)
+                    acc += probs[j];
+                for (int j = 0; j < n; j++)
+                    probs[j] /= acc;
+                for (int j = 1; j < n; j++)
+                    probs[j] += probs[j-1];
+                float choice = curand_uniform(state);
+                int k = 0;
+                for (; choice > probs[k]; k++);
+                current = k;
+                path[i] = k;
+                score += lgraph[current*n+path[i-1]];
+            }
+            score += lgraph[path[0]*n+path[n-1]];
+            for (int i = 0; i < n; i++) {
+                for (int j = tid; j<n; j+=nants) {
+                    ltrails[i*n+j] *= params[2];
+                }
+            }
+            __syncthreads();
+            for (int i = 1; i < n; i++) {
+                atomicAdd(&ltrails[path[i]*n+path[i-1]], 1.0/score);
+                atomicAdd(&ltrails[path[i-1]*n+path[i]],1.0/score);
+            }
+            atomicAdd(&ltrails[path[0]*n+path[n-1]],1.0/score);
+            atomicAdd(&ltrails[path[n-1]*n+path[0]],1.0/score);
+            __syncthreads();
+        }
+        /*
+        	reduce intrablocco
+        */
+        temp[tid] = score;
+        for (unsigned int s = nants/2; s > 0; s >>= 1) {
+            if (tid < s)
+                reduce[tid] = (temp[tid] < temp[tid+s])?tid:tid+s;
+            __syncthreads();
+        }
+        if (tid == reduce[0]) {
+            scores[blockIdx.x] = score;
+        }
+        __threadfence();
+        /*
+        	reduce interblocco
+        */
+        if (tid < gridDim.x)
+            temp[tid] = scores[tid];
+        for (unsigned int s = gridDim.x/2; s > 0; s >>= 1) {
+            if (tid < s)
+                reduce[tid] = (temp[tid]<temp[tid+s])?tid:tid+s;
+            __syncthreads();
+        }
+        if (blockIdx.x == reduce[0]) {
+            for (int i = 0; i < n; i++) {
+                for (int j = tid; j < n; j += nants) {
+                    gtrails[i*n+j] = ltrails[i*n+j];
+                }
+            }
+        }
+        __threadfence();
+        for (int i = 0; i <n; i++) {
+            for (int j = tid; j < n; j += nants) {
+                ltrails[i*n+j] = gtrails[i*n+j];
+            }
+        }
+        __syncthreads();
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -196,9 +208,10 @@ int main(int argc, char *argv[]) {
     int nformicai = atoi(argv[1]);
     int nformiche = atoi(argv[2]); //formiche per formicaio
     int nstadi = atoi(argv[3]);
-    int niters_per_stadio = atoi(argv[4]);
+    int niters = atoi(argv[4]);
+    float mstime;
     /*
-
+        inizializzazione
     */
     parse(argv[0]);
     graph = init_graph(n,x,y);
@@ -223,25 +236,19 @@ int main(int argc, char *argv[]) {
     	matrice percorsi nformiche*n (int)
     	buffer n int
     */
-    //size_t sharedsize = 2*n*n*sizeof(float) + nformiche*n*sizeof(float) + nformiche*n*sizeof(int) + n*sizeof(float); //aggiungere reduce buffer
     size_t sharedsize = 2*n*n*sizeof(float) + nformiche*n*sizeof(float) + nformiche*n*sizeof(int) + nformiche*sizeof(int);
     printf("totale memoria shared: %zu * %d = %zu\n", sharedsize, nformicai, sharedsize*nformicai);
-    /*
 
-    */
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     rand_init<<<nformicai,nformiche>>>(states,time(0));
     cudaEventRecord(start);
-    /*
 
-    */
     aco<<<nformicai,nformiche,sharedsize>>>(gpu_graph,gpu_trails,g_buffer,states,n,nstadi,niters);
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
-    float ms;
-    cudaEventElapsedTime(&ms,start,stop);
+    cudaEventElapsedTime(&mstime,start,stop);
     fprintf(stderr,"%f\n",ms);
     cudaError err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
@@ -250,6 +257,9 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     //output risultati
+    float results[nformicai];
+    cudaMemcpy(results,g_buffer,nformicai*sizeof(float),cudaMemcpyDeviceToHost);
+    printf("miglior punteggio: %f\n", vmin(results,nformicai)); 
     clean_memory();
     exit(0);
 }
