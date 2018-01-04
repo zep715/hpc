@@ -6,6 +6,7 @@
 
 int *x, *y, n, m, km, blocks = 40;
 float *graph, *trails, *gpu_graph = NULL, *gpu_trails = NULL,*g_buffer = NULL;
+cudaEvent_t start, stop;
 float hparams[3] = {1.0, 5.0, 0.5};
 __constant__ float params[3];
 
@@ -77,116 +78,132 @@ void abort(const char *s) {
     exit(1);
 }
 
-__global__ void aco(float *gpu_graph, float *gpu_trails, float *g_buffer, curandState *states,int nnodi,int nstadi, int iters_per_stadio) {
-	int tid = threadIdx.x;
-    int id = threadIdx.x + blockDim.x*blockIdx.x;
-    int n = blockDim.x;
-    curandState state = states[id];
-	__shared__ float punteggio;
-    extern __shared__ int s[];
-	int size = nnodi*nnodi;
-	/*
-	ripartizione shared memory
-	*/
-	float *lgraph = (float *) s;
-	float *ltrails = (float *) &s[size];
-	float *probs = (float *) &s[2*size + tid*nnodi];
-	int *path =  &s[2*size+n*nnodi+tid*n];
-	float *buffer = (float *) &s[2*size+2*n*nnodi];
-	//copia grafo e tracce da globale a shared
-    for (int i = 0; i < n; i++)
-        lgraph[i*n+tid] = gpu_graph[i*n+tid];
-    for (int i = 0; i < n; i++)
-        ltrails[i*n+tid] = gpu_trails[i*n+tid];
+__global__ void aco(float *ggraph, float *gtrails, float *gbuffer, curandState *states, int n, int nstadi, int niters) {
+    float *lgraph, *ltrails, *probs, *temp,score;
+    int *path,tid,nants,current;
+    extern __shared__ int smem[];
+	__shared__ int fscore; //punteggio del formicaio
+    curandState state;
+
+    tid = threadIdx.x;
+    nants = blockDim.x;
+    state = states[blockIdx.x*blockDim.x+threadIdx.x];
+    lgraph = (float *) smem;
+    ltrails = (float *) (smem + n*n);
+	temp = (float *) (smem +2*n*n);
+    probs = (float *) (smem + 2*n*n + tid*n);
+    path = (smem + 2*n*n + nants*n + tid*n);
+	reduce = (sem + 2*n*n + 2*nants*n);
+	
+    for (int i = 0; i < n; i++) {
+        for (int j = tid; j < n; j+=nants) {
+            lgraph[i*n+j] = ggraph[i*n+j];
+        }
+    }
     __syncthreads();
-	float length = 0.0;
-	for (int stadio = 0; stadio < nstadi; stadio++) {
-		for (int iters = 0; iters < iters_per_stadio; iters++) {
-			path[0] = curand(&state)%n;
-			int current = path[0];
-			for (int i = 1; i < n; i++) {
-				for (int j = 0; j < n; j++)
-					probs[j] = __powf(ltrails[current*n+j],params[0])*__powf(1.0/lgraph[current*n+j],params[1]);
-				for (int j = 0; j < i; j++)
-					probs[path[j]] = 0.0;
-				float acc = 0.0;
-				for (int j = 0; j < n; j++)
-					acc += probs[j];
-				for (int j = 0; j < n; j++)
-					probs[j] /= acc;
-				for (int j = 1; j < n; j++)
-					probs[j] = probs[j-1];
-				float choice = curand_uniform(&state);
-				int k = 0;
-				while (choice > probs[k])
-					k++;
-				current = k;
-				path[i] = k;
-				length += lgraph[path[i]*n+path[i-1]];
-			}
-			length += lgraph[path[0]*n+path[n-1]];
-			for (int i = 0; i < n; i++)
-				ltrails[i*n+tid] *= params[2];
-			for (int i = 1; i <n; i++) {
-				atomicAdd(&ltrails[path[i]*n+path[i-1]], 1.0/length);
-            	atomicAdd(&ltrails[path[i-1]*n+path[i]], 1.0/length);
-			}
-			atomicAdd(&ltrails[path[0]*n+path[n-1]], 1.0/length);
-			atomicAdd(&ltrails[path[n-1]*n+path[0]], 1.0/length);
-			__syncthreads();
-		}
-		
-		/*
-		reduce intrablocco
-		*/
-		buffer[tid] = length;
-		int *temp_buff = &s[3*n*n];
-		for (unsigned int s = n/2; s > 0; s>>=1) {
-		    if (tid<s)
-		        temp_buff[tid] = (buffer[tid] < buffer[tid+s]) ? tid:tid+s;
+    for (int i = 0; i < n; i++) {
+        for (int j = tid; j < n; j+=nants) {
+            ltrails[i*n+j] = gtrails[i*n+j];
+        }
+    }
+    __syncthreads();
+	for (int st = 0; st < nstadi; st++) {
+		for (int it = 0; i < niters; it++) {
+			score = 0.0;
+		    path[0] = curand(&state)%n;
+		    current = path[0];
+		    for (int i = 1; i < n; i++) {
+		        for (int j = 0; j < n; j++)
+		            probs[j] = __powf(ltrails[current*n+j],params[0])*__powf(1.0/lgraph[current*n+j],params[1]);
+		        for (int j = 0; j < i; j++)
+		            probs[path[j]] = 0.0f;
+		        float acc = 0;
+		        for (int j = 0; j < n; j++)
+		            acc += probs[j];
+		        for (int j = 0; j < n; j++)
+		            probs[j] /= acc;
+		        for (int j = 1; j < n; j++)
+		            probs[j] += probs[j-1];
+		        float choice = curand_uniform(&state);
+		        int k = 0;
+		        for (; choice > probs[k]; k++);
+		        current = k;
+		        path[i] = k;
+		        score += lgraph[current*n+path[i-1]];
+		    }
+		    score += lgraph[path[0]*n+path[n-1]];
+		    for (int i = 0; i < n; i++) {
+		        for (int j = tid; j< n; j+=nants) {
+		            ltrails[i*n+j] *= params[2];
+		        }
+		    }
+		    __syncthreads();
+		    for (int i = 1; i < n; i++) {
+		        atomicAdd(&ltrails[path[i]*n+path[i-1]], 1.0/score);
+		        atomicAdd(&ltrails[path[i-1]*n+path[i]],1.0/score);
+		    }
+		    atomicAdd(&ltrails[path[0]*n+path[n-1]],1.0/score);
+		    atomicAdd(&ltrails[path[n-1]*n+path[0]],1.0/score);
 		    __syncthreads();
 		}
-		if (tid == temp_buff[0]) {
-		    g_buffer[blockIdx.x] = length;
-			punteggio = length;
+		/*
+			reduce intrablocco
+		*/
+		temp[tid] = score;
+		for (unsigned int s = nants/2; s > 0; s >>= 1) {
+			if (tid < s)
+				reduce[tid] = (temp[tid] < temp[tid+s])?tid:tid+s;
+			__synchthreads();
+		}
+		if (tid == reduce[0]) {
+			fscore = score;
+			gbuffer[blockIdx.x] = score;
 		}
 		__threadfence();
 		/*
-		reduce interblocco
+			reduce interblocco
 		*/
-		for (int i = 0; i < n; i++) {
-			if (punteggio == g_buffer[i]) {
-				for (int j = 0; j < n; j++)
-					gpu_trails[i*n+tid] = ltrails[i*n+tid];
-			} 
+		if (tid < gridDim.x)
+			temp[tid] = gbuffer[tid];
+		for (unsigned int s = gridDim.x/2; s > 0; s >>= 1) {
+			if (tid < s)
+				reduce[tid] = (temp[tid]  < temp[tid+s])?tid:tid+s;
+			__synchthreads();
+		}
+		if (blockIdx.x == reduce[0]) {
+			for (int i = 0; i < n; i++) {
+				for (int j = tid; j < n; j += nants) {
+					gtrails[i*n+j] = ltrails[i*n+j];
+				}
+			}
 		}
 		__threadfence();
-		for (int i = 0; i < n; i++)
-			ltrails[i*n+tid] = gpu_trails[i*n+tid];
-		__syncthreads();
-			
+		for (int i = 0; i <n; i++) {
+			for (int j = tid; j < n; j += nants) {
+				ltrails[i*n+j] = gtrails[i*n+j];
+			}
+		}
+		__synchthreads();
 	}
-
 }
 
 int main(int argc, char *argv[]) {
-	argc--,argv++;
-	if (argc != 5) {
-		printf("./acotaskp [file] [numero di formicai] [numero di formiche per formicaio] [numero stadi] [numero iterazioni per stadio]\n");
-		exit(1);
-	}
-	int nformicai = atoi(argv[1]);
-	int nformiche = atoi(argv[2]); //formiche per formicaio
-	int nstadi = atoi(argv[3]);
-	int niters_per_stadio = atoi(argv[4]);
-	/*
+    argc--,argv++;
+    if (argc != 5) {
+        printf("./acotaskp [file] [numero di formicai] [numero di formiche per formicaio] [numero stadi] [numero iterazioni per stadio]\n");
+        exit(1);
+    }
+    int nformicai = atoi(argv[1]);
+    int nformiche = atoi(argv[2]); //formiche per formicaio
+    int nstadi = atoi(argv[3]);
+    int niters_per_stadio = atoi(argv[4]);
+    /*
 
-	*/
-	parse(argv[0]);
-	graph = init_graph(n,x,y);
+    */
+    parse(argv[0]);
+    graph = init_graph(n,x,y);
     trails = init_trails(n,0.3);
     gpu_graph = (float *) gpucopy(graph,n*n*sizeof(float));
-	cudaEvent_t start, stop;
     if (!gpu_graph)
         abort("errore nella copia del grafo alla gpu\n");
     gpu_trails = (float *) gpucopy(trails,n*n*sizeof(float));
@@ -194,44 +211,45 @@ int main(int argc, char *argv[]) {
         abort("errore nella copia della matrice delle tracce alla gpu\n");
     if (cudaMemcpyToSymbol(params,hparams,3*sizeof(float)) != cudaSuccess)
         abort("errore nella copia dei parametri alla gpu\n");
-	curandState *states;
+    curandState *states;
     if (cudaMalloc(&states,nformicai*nformiche*sizeof(curandState)) != cudaSuccess)
         abort("errore nell'inizializzazione dell'rng su gpu\n");
-	if(cudaMalloc(&g_buffer,nformicai*sizeof(float)) != cudaSuccess)
+    if(cudaMalloc(&g_buffer,nformicai*sizeof(float)) != cudaSuccess)
         abort("errore allocazione buffer globale nella gpu\n");
-	/*
-		calcolo shared memory necessaria
-		matrice grafo + tracce 2*n*n (float)
-		matrice probabilità nformiche * n (float)
-		matrice percorsi nformiche *n (int)
-		buffer n float
-	*/
-	size_t sharedsize = 2*n*n*sizeof(float) + nformiche*n*sizeof(float) + nformiche*n*sizeof(int) + n*sizeof(float); //aggiungere reduce buffer
-	printf("total shared size: %zu * %d = %zu\n", sharedsize, nformicai, sharedsize*nformicai);
-	/*
+    /*
+    	calcolo shared memory necessaria
+    	matrice grafo + tracce 2*n*n (float)
+    	matrice probabilità nformiche*n (float)
+    	matrice percorsi nformiche*n (int)
+    	buffer n int
+    */
+    //size_t sharedsize = 2*n*n*sizeof(float) + nformiche*n*sizeof(float) + nformiche*n*sizeof(int) + n*sizeof(float); //aggiungere reduce buffer
+    size_t sharedsize = 2*n*n*sizeof(float) + nformiche*n*sizeof(float) + nformiche*n*sizeof(int) + nformiche*sizeof(int);
+    printf("totale memoria shared: %zu * %d = %zu\n", sharedsize, nformicai, sharedsize*nformicai);
+    /*
 
-	*/
-	cudaEventCreate(&start);
+    */
+    cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    rand_init<<<blocks,n>>>(states,time(0));
+    rand_init<<<nformicai,nformiche>>>(states,time(0));
     cudaEventRecord(start);
-	/*
+    /*
 
-	*/
-	aco<<<nformicai,nformiche,sharedsize>>>(gpu_graph,gpu_trails,g_buffer,states,n,nstadi,niters_per_stadio);
-	
-	cudaEventRecord(stop);
+    */
+    aco<<<nformicai,nformiche,sharedsize>>>(gpu_graph,gpu_trails,g_buffer,states,n,nstadi,niters);
+
+    cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     float ms;
     cudaEventElapsedTime(&ms,start,stop);
     fprintf(stderr,"%f\n",ms);
-	cudaError err = cudaDeviceSynchronize();
-	if (err != cudaSuccess) {
-		printf("errore dopo lancio kernel: %s\n", cudaGetErrorString(err));
-		clean_memory();
-		exit(1);
-	}
-	//fare output risultati
-	clean_memory();
-	exit(0);
+    cudaError err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        printf("errore dopo lancio kernel: %s\n", cudaGetErrorString(err));
+        clean_memory();
+        exit(1);
+    }
+    //output risultati
+    clean_memory();
+    exit(0);
 }
